@@ -1,6 +1,21 @@
-from distutils.core import setup
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import os
+from distutils.core import setup, Command
 import dtree
-setup(name='dtree',
+
+class TestCommand(Command):
+    description = "Runs unittests."
+    user_options = []
+    def initialize_options(self):
+        pass
+    def finalize_options(self):
+        pass
+    def run(self):
+        os.system('python dtree.py')
+
+setup(
+    name='dtree',
     version=dtree.__version__,
     description='A simple pure-Python batch decision tree construction algorithm.',
     author='Chris Spencer',
@@ -18,4 +33,9 @@ setup(name='dtree',
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    platforms=['OS Independent'],)
+    platforms=['OS Independent'],
+#    test_suite='dtree',
+    cmdclass={
+        'test': TestCommand,
+    },
+)

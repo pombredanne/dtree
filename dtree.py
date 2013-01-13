@@ -14,7 +14,7 @@ import random
 import re
 import unittest
 
-VERSION = (0, 2, 0)
+VERSION = (0, 2, 1)
 __version__ = '.'.join(map(str, VERSION))
 
 # Traditional entropy.
@@ -89,6 +89,9 @@ def variance(seq):
     m = mean(seq)
     return sum((v-m)**2 for v in seq)/float(len(seq))
 
+def standard_deviation(seq):
+    return math.sqrt(variance(seq))
+
 def mean_absolute_error(seq, correct):
     """
     Batch mean absolute error calculation.
@@ -103,6 +106,58 @@ def normalize(seq):
     """
     s = float(sum(seq))
     return [v/s for v in seq]
+
+def erfcc(x):
+    """
+    Complementary error function.
+    """
+    z = abs(x)
+    t = 1. / (1. + 0.5*z)
+    r = t * math.exp(-z*z-1.26551223+t*(1.00002368+t*(.37409196+
+        t*(.09678418+t*(-.18628806+t*(.27886807+
+        t*(-1.13520398+t*(1.48851587+t*(-.82215223+
+        t*.17087277)))))))))
+    if (x >= 0.):
+        return r
+    else:
+        return 2. - r
+
+def normcdf(x, mu, sigma):
+    """
+    Describes the probability that a real-valued random variable X with a given
+    probability distribution will be found at a value less than or equal to X
+    in a normal distribution.
+    
+    http://en.wikipedia.org/wiki/Cumulative_distribution_function
+    """
+    t = x-mu;
+    y = 0.5*erfcc(-t/(sigma*math.sqrt(2.0)));
+    if y>1.0:
+        y = 1.0;
+    return y
+
+def normpdf(x, mu, sigma):
+    """
+    Describes the relative likelihood that a real-valued random variable X will
+    take on a given value.
+    
+    http://en.wikipedia.org/wiki/Probability_density_function
+    """
+    u = (x-mu)/abs(sigma)
+    y = (1/(math.sqrt(2*pi)*abs(sigma)))*math.exp(-u*u/2)
+    return y
+
+def normdist(x, mu, sigma, f=True):
+    if f:
+        y = normcdf(x,mu,sigma)
+    else:
+        y = normpdf(x,mu,sigma)
+    return y
+
+def normrange(x1, x2, mu, sigma, f=True):
+    p1 = normdist(x1, mu, sigma, f)
+    p2 = normdist(x2, mu, sigma, f)
+    return abs(p1-p2)
 
 class DDist(object):
     """
@@ -211,8 +266,17 @@ class CDist(object):
     Incrementally tracks the probability distribution of continuous numbers.
     """
     
-    def __init__(self, seq=None):
+    def __init__(self, seq=None, mean=None, var=None, stdev=None):
         self.clear()
+        if mean is not None:
+            self.mean_sum = mean
+            self.mean_count = 1
+        if var is not None:
+            self.last_variance = var
+            self.mean_count = 1
+        if stdev is not None:
+            self.last_variance = stdev**2
+            self.mean_count = 1
         if seq:
             for n in seq:
                 self += n
@@ -254,7 +318,43 @@ class CDist(object):
     def variance(self):
         if self.mean_count:
             return self.last_variance/float(self.mean_count)
-
+        
+    @property
+    def standard_deviation(self):
+        var = self.variance
+        if var is None:
+            return
+        return math.sqrt(var)
+    
+    def probability_lt(self, x):
+        """
+        Returns the probability of a random variable being less than the
+        given value.
+        """
+        if self.mean is None:
+            return
+        return normdist(x=x, mu=self.mean, sigma=self.standard_deviation)
+    
+    def probability_in(self, a, b):
+        """
+        Returns the probability of a random variable falling between the given
+        values.
+        """
+        if self.mean is None:
+            return
+        p1 = normdist(x=a, mu=self.mean, sigma=self.standard_deviation)
+        p2 = normdist(x=b, mu=self.mean, sigma=self.standard_deviation)
+        return abs(p1 - p2)
+    
+    def probability_gt(self, x):
+        """
+        Returns the probability of a random variable being greater than the
+        given value.
+        """
+        if self.mean is None:
+            return
+        p = normdist(x=x, mu=self.mean, sigma=self.standard_deviation)
+        return 1-p
 
 def entropy(data, class_attr=None, method=DEFAULT_DISCRETE_METRIC):
     """
@@ -514,6 +614,14 @@ class Data(object):
             order = order.split(',')
         self.header_order = order or [] # [attr_name,...]
         
+        # Validate header type.
+        if isinstance(self.header_types, (tuple, list)):
+            assert self.header_order, 'If header type names were not ' + \
+                'given, an explicit order must be specified.'
+            assert len(self.header_types) == len(self.header_order), \
+                'Header order length must match header type length.'
+            self.header_types = dict(zip(self.header_order, self.header_types))
+        
         self.filename = None
         self.data = None
         if isinstance(inp, basestring):
@@ -535,7 +643,17 @@ class Data(object):
                 self._class_attr_name = k
                 break
             assert self._class_attr_name, "No class attribute specified."
-                
+    
+    def copy_no_data(self):
+        """
+        Returns a copy of the object without any data.
+        """
+        return type(self)(
+            [],
+            order=list(self.header_modes),
+            types=self.header_types.copy(),
+            modes=self.header_modes.copy())
+    
     def __len__(self):
         if self.filename:
             return max(0, open(self.filename).read().strip().count('\n'))
@@ -644,6 +762,39 @@ class Data(object):
             if not row:
                 continue
             yield self.validate_row(row)
+            
+    def split(self, ratio=0.5, leave_one_out=False):
+        """
+        Returns two Data instances, containing the data randomly split between
+        the two according to the given ratio.
+        
+        The first instance will contain the ratio of data specified.
+        The second instance will contain the remaining ratio of data.
+        
+        If leave_one_out is True, the ratio will be ignored and the first
+        instance will contain exactly one record for each class label, and
+        the second instance will contain all remaining data.
+        """
+        a_labels = set()
+        a = self.copy_no_data()
+        b = self.copy_no_data()
+        for row in self:
+            if leave_one_out and not self.is_continuous_class:
+                label = row[self.class_attribute_name]
+                if label not in a_labels:
+                    a_labels.add(label)
+                    a.data.append(row)
+                else:
+                    b.data.append(row)
+            elif not len(a):
+                a.data.append(row)
+            elif not len(b):
+                b.data.append(row)
+            elif random.random() <= ratio:
+                a.data.append(row)
+            else:
+                b.data.append(row)
+        return a,b
 
 USE_NEAREST = 'use_nearest'
 MISSING_VALUE_POLICIES = set([
@@ -1464,6 +1615,13 @@ class Test(unittest.TestCase):
         self.assertAlmostEqual(s.mean, mean(nums), 1)
         self.assertAlmostEqual(s.variance, variance(nums), 2)
         self.assertEqual(s.count, 9)
+#        print s.mean
+#        print s.standard_deviation
+        self.assertAlmostEqual(s.probability_lt(s.mean-s.standard_deviation*6), 0.0, 5)
+        self.assertAlmostEqual(s.probability_lt(s.mean+s.standard_deviation*6), 1.0, 5)
+        self.assertAlmostEqual(s.probability_gt(s.mean-s.standard_deviation*6), 1.0, 5)
+        self.assertAlmostEqual(s.probability_gt(s.mean+s.standard_deviation*6), 0.0, 5)
+        self.assertAlmostEqual(s.probability_in(s.mean, 50), 0.5, 5)
         
         d1 = DDist(['a','b','a','a','b'])
         d2 = DDist(['a','b','a','a','b'])
@@ -1520,6 +1678,18 @@ class Test(unittest.TestCase):
         self.assertEqual(len(list(rows)), 16)
         for row in rows:
             print row
+            
+        a,b = rows.split(ratio=0.1)
+        self.assertEqual(len(rows), len(a)+len(b))
+        print '-'*80
+        print 'a:'
+        for row in a:
+            print row
+        print '-'*80
+        print 'b:'
+        for row in b:
+            print row
+            
         print 'Done.'
 
     def test_batch_tree(self):
@@ -1755,6 +1925,76 @@ class Test(unittest.TestCase):
 #        for tree in trees:
 #            pprint(tree.to_dict(), indent=4)
         print 'Done.'
+        
+    def test_milksets(self):
+        try:
+            from milksets import wine, yeast
+        except ImportError, e:
+            print 'Skipping milkset tests because milksets is not installed.'
+            print 'Run `sudo pip install milksets` and rerun these tests.'
+            return
+        
+        def leave_one_out(all_data, metric=None):
+            test_data,train_data = all_data.split(leave_one_out=True)
+#            print 'test:',len(test_data)
+#            print 'train:',len(train_data)
+            tree = Tree.build(train_data, metric=metric)
+            tree.set_missing_value_policy(USE_NEAREST)
+            result = tree.test(test_data)
+            return result.mean
+        
+        def cross_validate(all_data, epoches=10, test_ratio=0.25, metric=None):
+            accuracies = []
+            for epoche in xrange(epoches):
+#                print 'Epoch:',epoche
+                #test_data,train_data = all_data,all_data
+                test_data,train_data = all_data.split(ratio=test_ratio)
+#                print '\ttest:',len(test_data)
+#                print '\ttrain:',len(train_data)
+                tree = Tree.build(train_data, metric=metric)
+                tree.set_missing_value_policy(USE_NEAREST)
+                result = tree.test(test_data)
+#                print 'Epoch accuracy:',result.mean
+                accuracies.append(result.mean)
+            return sum(accuracies)/float(len(accuracies))
+        
+        # Load wine dataset.
+        # Each record has 13 continuous features
+        # and one discrete class containing 2 unique values.
+        print 'Loading UCI wine data...'
+        wine_data = Data(
+             [list(a)+[b] for a,b in zip(*wine.load())],
+            order=map(str,range(13))+['cls'],
+            #types=dict(a=DIS, b=DIS, c=DIS, d=DIS, cls=NOM),
+            types=[CON]*13 + [DIS],
+            modes=dict(cls=CLS))
+        self.assertEqual(len(wine_data), 178)
+        self.assertEqual(len(list(wine_data)), 178)
+#        for row in wine_data:
+#            print row
+            
+        # Load yeast dataset.
+        # Each record has 8 continuous features
+        # and one discrete class containing 10 values.
+        print 'Loading UCI yeast data...'
+        yeast_data = Data(
+             [list(a)+[b] for a,b in zip(*yeast.load())],
+            order=map(str,range(8))+['cls'],
+            #types=dict(a=DIS, b=DIS, c=DIS, d=DIS, cls=NOM),
+            types=[CON]*8 + [DIS],
+            modes=dict(cls=CLS))
+        self.assertEqual(len(yeast_data), 1484)
+        self.assertEqual(len(list(yeast_data)), 1484)
+        
+        acc = leave_one_out(wine_data, metric=ENTROPY1)
+        print 'Wine leave-one-out accuracy: %0.2f' % (acc,)
+        acc = cross_validate(wine_data, metric=ENTROPY1, test_ratio=0.01, epoches=25)
+        print 'Wine cross-validated accuracy: %0.2f' % (acc,)
+        
+        acc = leave_one_out(yeast_data, metric=ENTROPY1)
+        print 'Yeast leave-one-out accuracy: %0.2f' % (acc,)
+        acc = cross_validate(yeast_data, metric=ENTROPY1, test_ratio=0.005, epoches=25)
+        print 'Yeast cross-validated accuracy: %0.2f' % (acc,)
 
 if __name__ == '__main__':
     unittest.main()
